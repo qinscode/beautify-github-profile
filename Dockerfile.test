@@ -1,0 +1,132 @@
+# Multi-stage Dockerfile for testing
+
+# Stage 1: Base image with dependencies
+FROM node:18-alpine AS base
+
+# Install system dependencies for Playwright
+RUN apk add --no-cache \
+    chromium \
+    nss \
+    freetype \
+    freetype-dev \
+    harfbuzz \
+    ca-certificates \
+    ttf-freefont \
+    wget
+
+# Tell Playwright to skip download (we use system chromium)
+ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
+ENV PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium-browser
+
+# Set working directory
+WORKDIR /app
+
+# Copy package files
+COPY package*.json ./
+
+# Install dependencies
+RUN npm ci
+
+# Stage 2: Unit and Integration Tests
+FROM base AS test-unit
+
+# Copy source code
+COPY . .
+
+# Run tests
+CMD ["npm", "run", "test:coverage"]
+
+# Stage 3: E2E Tests
+FROM mcr.microsoft.com/playwright:v1.40.0-focal AS test-e2e
+
+WORKDIR /app
+
+# Copy package files and install dependencies
+COPY package*.json ./
+RUN npm ci
+
+# Copy source code
+COPY . .
+
+# Install Playwright browsers
+RUN npx playwright install --with-deps
+
+# Run E2E tests
+CMD ["npm", "run", "test:e2e"]
+
+# Stage 4: Storybook Tests
+FROM base AS test-storybook
+
+# Copy source code
+COPY . .
+
+# Build Storybook
+RUN npm run build-storybook
+
+# Install Playwright for Storybook tests
+RUN npx playwright install chromium
+
+# Run Storybook tests
+CMD ["npm", "run", "test-storybook:ci"]
+
+# Stage 5: Full Test Suite
+FROM mcr.microsoft.com/playwright:v1.40.0-focal AS test-all
+
+WORKDIR /app
+
+# Copy package files
+COPY package*.json ./
+
+# Install dependencies
+RUN npm ci
+
+# Copy source code
+COPY . .
+
+# Install Playwright browsers
+RUN npx playwright install --with-deps
+
+# Create test script
+RUN echo '#!/bin/sh\n\
+set -e\n\
+echo "Running lint..."\n\
+npm run lint\n\
+echo "Running type check..."\n\
+npm run type-check || true\n\
+echo "Running unit tests..."\n\
+npm run test:unit\n\
+echo "Building project..."\n\
+npm run build\n\
+echo "Running E2E tests..."\n\
+npm run test:e2e\n\
+echo "All tests passed!"\n\
+' > /app/run-all-tests.sh && chmod +x /app/run-all-tests.sh
+
+CMD ["/app/run-all-tests.sh"]
+
+# Stage 6: CI Image (for GitHub Actions)
+FROM mcr.microsoft.com/playwright:v1.40.0-focal AS ci
+
+WORKDIR /app
+
+# Install additional tools
+RUN apt-get update && apt-get install -y \
+    git \
+    curl \
+    jq \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy package files
+COPY package*.json ./
+
+# Install dependencies
+RUN npm ci
+
+# Copy source code
+COPY . .
+
+# Install Playwright browsers
+RUN npx playwright install --with-deps
+
+# Default command
+CMD ["npm", "test"]

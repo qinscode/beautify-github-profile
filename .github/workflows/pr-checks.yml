@@ -1,0 +1,525 @@
+name: CI - Pull Request
+
+on:
+  pull_request:
+    branches: [main, develop]
+    types: [opened, synchronize, reopened]
+
+# Ensure only one workflow runs at a time per PR
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  # Quick checks that should run first
+  quick-checks:
+    name: Quick Checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Check for console.log
+        run: |
+          if grep -r "console.log" src/; then
+            echo "❌ Found console.log statements in src/"
+            exit 1
+          fi
+        continue-on-error: true
+
+      - name: Check package-lock.json
+        run: |
+          if git diff --exit-code package-lock.json; then
+            echo "✅ package-lock.json is up to date"
+          else
+            echo "❌ package-lock.json is out of sync"
+            exit 1
+          fi
+
+      - name: Check for merge conflicts
+        run: |
+          if grep -r "<<<<<<< HEAD" .; then
+            echo "❌ Found merge conflict markers"
+            exit 1
+          fi
+
+  # Code quality checks
+  code-quality:
+    name: Code Quality
+    runs-on: ubuntu-latest
+    needs: quick-checks
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run ESLint
+        run: npm run lint
+
+      - name: Run Prettier check
+        run: npx prettier --check "src/**/*.{ts,tsx,js,jsx,css,md}"
+        continue-on-error: true
+
+      - name: TypeScript type check
+        run: npm run type-check
+
+      - name: Check bundle size
+        run: |
+          npm run build
+          npx bundlesize
+        continue-on-error: true
+
+  # Unit and Integration tests
+  test-unit:
+    name: Unit & Integration Tests
+    runs-on: ubuntu-latest
+    needs: code-quality
+
+    strategy:
+      matrix:
+        node-version: [18, 20]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run unit tests
+        run: npm run test:unit -- --reporter=verbose --reporter=json --outputFile=test-results-${{ matrix.node-version }}.json
+
+      - name: Run tests with coverage
+        run: npm run test:coverage
+
+      - name: Generate coverage badge
+        uses: cicirello/jacoco-badge-generator@v2
+        if: matrix.node-version == 18
+        with:
+          badges-directory: badges
+          generate-coverage-badge: true
+        continue-on-error: true
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v3
+        if: matrix.node-version == 18
+        with:
+          files: ./coverage/lcov.info
+          flags: unittests
+          name: codecov-unit-${{ matrix.node-version }}
+          fail_ci_if_error: false
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: test-results-${{ matrix.node-version }}
+          path: |
+            test-results-${{ matrix.node-version }}.json
+            coverage/
+
+      - name: Comment PR with coverage
+        if: matrix.node-version == 18 && github.event_name == 'pull_request'
+        uses: romeovs/lcov-reporter-action@v0.3.1
+        with:
+          lcov-file: ./coverage/lcov.info
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+        continue-on-error: true
+
+  # Build verification
+  build:
+    name: Build Verification
+    runs-on: ubuntu-latest
+    needs: code-quality
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build project
+        run: npm run build
+
+      - name: Check build output
+        run: |
+          if [ ! -d "dist" ]; then
+            echo "❌ Build directory not found"
+            exit 1
+          fi
+          echo "✅ Build successful"
+          ls -lh dist/
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: build-artifacts
+          path: dist/
+          retention-days: 7
+
+  # E2E tests
+  test-e2e:
+    name: E2E Tests - ${{ matrix.browser }}
+    runs-on: ubuntu-latest
+    needs: build
+
+    strategy:
+      fail-fast: false
+      matrix:
+        browser: [chromium, firefox, webkit]
+        shard: [1, 2]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install Playwright browsers
+        run: npx playwright install --with-deps ${{ matrix.browser }}
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v3
+        with:
+          name: build-artifacts
+          path: dist/
+
+      - name: Run E2E tests
+        run: npm run test:e2e -- --project=${{ matrix.browser }} --shard=${{ matrix.shard }}/2
+        env:
+          CI: true
+
+      - name: Upload Playwright report
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: playwright-report-${{ matrix.browser }}-${{ matrix.shard }}
+          path: playwright-report/
+          retention-days: 7
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: e2e-results-${{ matrix.browser }}-${{ matrix.shard }}
+          path: test-results/
+          retention-days: 7
+
+  # Storybook tests
+  test-storybook:
+    name: Storybook Tests
+    runs-on: ubuntu-latest
+    needs: code-quality
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build Storybook
+        run: npm run build-storybook
+
+      - name: Install Playwright for Storybook
+        run: npx playwright install --with-deps chromium
+
+      - name: Run Storybook tests
+        run: |
+          npx concurrently -k -s first -n "SB,TEST" -c "magenta,blue" \
+            "npx http-server storybook-static --port 6006 --silent" \
+            "npx wait-on tcp:6006 && npm run test-storybook"
+
+      - name: Upload Storybook
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: storybook-static
+          path: storybook-static/
+          retention-days: 7
+
+  # Visual regression with Chromatic
+  chromatic:
+    name: Visual Regression
+    runs-on: ubuntu-latest
+    needs: code-quality
+    if: github.event.pull_request.draft == false
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Publish to Chromatic
+        uses: chromaui/action@v1
+        with:
+          projectToken: ${{ secrets.CHROMATIC_PROJECT_TOKEN }}
+          exitZeroOnChanges: true
+          exitOnceUploaded: true
+          onlyChanged: true
+        continue-on-error: true
+
+  # Accessibility tests
+  accessibility:
+    name: Accessibility Tests
+    runs-on: ubuntu-latest
+    needs: build
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v3
+        with:
+          name: build-artifacts
+          path: dist/
+
+      - name: Run accessibility tests
+        run: |
+          npm run dev &
+          sleep 10
+          npx pa11y-ci --config .pa11yci.json
+        continue-on-error: true
+
+      - name: Run axe tests
+        run: npm run test:a11y
+        continue-on-error: true
+
+  # Security scanning
+  security:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    needs: quick-checks
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18
+          cache: 'npm'
+
+      - name: Run npm audit
+        run: npm audit --audit-level=moderate
+        continue-on-error: true
+
+      - name: Run Snyk security scan
+        uses: snyk/actions/node@master
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        with:
+          args: --severity-threshold=high
+        continue-on-error: true
+
+      - name: Run CodeQL analysis
+        uses: github/codeql-action/init@v2
+        with:
+          languages: javascript,typescript
+        continue-on-error: true
+
+      - name: Perform CodeQL analysis
+        uses: github/codeql-action/analyze@v2
+        continue-on-error: true
+
+  # Lighthouse performance
+  lighthouse:
+    name: Lighthouse Performance
+    runs-on: ubuntu-latest
+    needs: build
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v3
+        with:
+          name: build-artifacts
+          path: dist/
+
+      - name: Run Lighthouse CI
+        run: |
+          npm install -g @lhci/cli
+          npm run preview &
+          sleep 10
+          lhci autorun
+        env:
+          LHCI_GITHUB_APP_TOKEN: ${{ secrets.LHCI_GITHUB_APP_TOKEN }}
+        continue-on-error: true
+
+      - name: Upload Lighthouse results
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: lighthouse-results
+          path: .lighthouseci/
+          retention-days: 7
+
+  # PR status check
+  pr-status:
+    name: PR Status Check
+    runs-on: ubuntu-latest
+    needs:
+      - test-unit
+      - test-e2e
+      - test-storybook
+      - build
+      - accessibility
+    if: always()
+
+    steps:
+      - name: Check test results
+        run: |
+          echo "Test Results:"
+          echo "- Unit Tests: ${{ needs.test-unit.result }}"
+          echo "- E2E Tests: ${{ needs.test-e2e.result }}"
+          echo "- Storybook Tests: ${{ needs.test-storybook.result }}"
+          echo "- Build: ${{ needs.build.result }}"
+          echo "- Accessibility: ${{ needs.accessibility.result }}"
+
+      - name: Fail if any required test failed
+        if: |
+          needs.test-unit.result == 'failure' ||
+          needs.test-e2e.result == 'failure' ||
+          needs.test-storybook.result == 'failure' ||
+          needs.build.result == 'failure'
+        run: |
+          echo "❌ One or more required tests failed"
+          exit 1
+
+      - name: Success
+        if: success()
+        run: echo "✅ All required tests passed!"
+
+  # Comment PR with results
+  comment-pr:
+    name: Comment PR
+    runs-on: ubuntu-latest
+    needs: pr-status
+    if: always() && github.event_name == 'pull_request'
+
+    steps:
+      - name: Comment PR
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+
+            const botComment = comments.find(comment =>
+              comment.user.type === 'Bot' &&
+              comment.body.includes('Test Results Summary')
+            );
+
+            const output = `## Test Results Summary
+
+            | Test Type | Status |
+            |-----------|--------|
+            | Unit Tests | ${{ needs.test-unit.result == 'success' && '✅ Passed' || '❌ Failed' }} |
+            | E2E Tests | ${{ needs.test-e2e.result == 'success' && '✅ Passed' || '❌ Failed' }} |
+            | Storybook | ${{ needs.test-storybook.result == 'success' && '✅ Passed' || '❌ Failed' }} |
+            | Build | ${{ needs.build.result == 'success' && '✅ Passed' || '❌ Failed' }} |
+            | Accessibility | ${{ needs.accessibility.result == 'success' && '✅ Passed' || '⚠️ Warning' }} |
+
+            **Workflow**: [View Details](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+
+            *Updated at ${new Date().toUTCString()}*
+            `;
+
+            if (botComment) {
+              github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: botComment.id,
+                body: output
+              });
+            } else {
+              github.rest.issues.createComment({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: output
+              });
+            }

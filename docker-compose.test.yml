@@ -1,0 +1,154 @@
+version: '3.8'
+
+services:
+  # Unit and Integration Tests
+  test-unit:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+      target: test-unit
+    container_name: bgp-test-unit
+    volumes:
+      - ./coverage:/app/coverage
+      - ./test-results:/app/test-results
+    environment:
+      - CI=true
+      - NODE_ENV=test
+    command: npm run test:coverage
+
+  # E2E Tests
+  test-e2e:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+      target: test-e2e
+    container_name: bgp-test-e2e
+    volumes:
+      - ./playwright-report:/app/playwright-report
+      - ./test-results:/app/test-results
+    environment:
+      - CI=true
+      - BASE_URL=http://localhost:5173
+    # Use host network to access dev server
+    network_mode: host
+    depends_on:
+      - dev-server
+    command: npm run test:e2e
+
+  # E2E Tests - Chromium
+  test-e2e-chromium:
+    extends: test-e2e
+    container_name: bgp-test-e2e-chromium
+    command: npm run test:e2e -- --project=chromium
+
+  # E2E Tests - Firefox
+  test-e2e-firefox:
+    extends: test-e2e
+    container_name: bgp-test-e2e-firefox
+    command: npm run test:e2e -- --project=firefox
+
+  # E2E Tests - WebKit
+  test-e2e-webkit:
+    extends: test-e2e
+    container_name: bgp-test-e2e-webkit
+    command: npm run test:e2e -- --project=webkit
+
+  # Storybook Tests
+  test-storybook:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+      target: test-storybook
+    container_name: bgp-test-storybook
+    ports:
+      - "6006:6006"
+    volumes:
+      - ./storybook-static:/app/storybook-static
+    environment:
+      - CI=true
+    command: npm run test-storybook:ci
+
+  # Full Test Suite
+  test-all:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+      target: test-all
+    container_name: bgp-test-all
+    volumes:
+      - ./coverage:/app/coverage
+      - ./playwright-report:/app/playwright-report
+      - ./test-results:/app/test-results
+      - ./storybook-static:/app/storybook-static
+    environment:
+      - CI=true
+      - NODE_ENV=test
+    command: /app/run-all-tests.sh
+
+  # Development Server (for E2E tests)
+  dev-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: development
+    container_name: bgp-dev-server
+    ports:
+      - "5173:5173"
+    volumes:
+      - .:/app
+      - /app/node_modules
+    environment:
+      - NODE_ENV=development
+    command: npm run dev -- --host 0.0.0.0
+
+  # Continuous Test Watcher
+  test-watch:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+      target: base
+    container_name: bgp-test-watch
+    volumes:
+      - .:/app
+      - /app/node_modules
+    environment:
+      - NODE_ENV=test
+    command: npm run test:watch
+
+  # Coverage Server
+  coverage-server:
+    image: nginx:alpine
+    container_name: bgp-coverage-server
+    ports:
+      - "8080:80"
+    volumes:
+      - ./coverage:/usr/share/nginx/html:ro
+    depends_on:
+      - test-unit
+
+  # Storybook Server
+  storybook:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+      target: base
+    container_name: bgp-storybook
+    ports:
+      - "6006:6006"
+    volumes:
+      - .:/app
+      - /app/node_modules
+    command: npm run storybook -- --host 0.0.0.0
+
+# Volumes for persistent data
+volumes:
+  node_modules:
+  coverage:
+  test-results:
+  playwright-report:
+  storybook-static:
+
+# Networks
+networks:
+  default:
+    name: bgp-test-network
